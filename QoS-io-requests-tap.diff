@@ -1,0 +1,326 @@
+diff -ur linux-2.6.18.x86_64-o/drivers/xen/blktap/blktapmain.c linux-2.6.18.x86_64/drivers/xen/blktap/blktapmain.c
+--- linux-2.6.18.x86_64-o/drivers/xen/blktap/blktapmain.c	2010-03-24 15:24:15.000000000 +0300
++++ linux-2.6.18.x86_64/drivers/xen/blktap/blktapmain.c	2010-03-25 20:10:33.000000000 +0300
+@@ -304,6 +304,26 @@
+     (_g)->kernel = INVALID_GRANT_HANDLE; (_g)->user = INVALID_GRANT_HANDLE; \
+     } while(0)
+ 
++static void refill_reqcount(blkif_t *blkif)
++{
++       uint j = jiffies_to_msecs(jiffies - blkif->reqtime) / 1000;
++       if(!j)
++               j=1;
++
++       blkif->reqcount += blkif->reqfill * j ;
++       blkif->reqtime = jiffies + msecs_to_jiffies(1000 * blkif->reqtick);
++       if (blkif->reqcount > blkif->reqmax)
++               blkif->reqcount = blkif->reqmax;
++       if (blkif->reqfill > blkif->reqmax)
++               blkif->reqfill = blkif->reqmax;
++       if (blkif->reqtick > 255)
++               blkif->reqtick = 255;
++
++       if (debug_lvl)
++                printk(KERN_WARNING
++                       "refill_reqcount [%s]: reqcount=%d reqmax=%d reqtime=%ld jiffies=%ld reqtick=%d difftime=%u \n", 
++                       current->comm, blkif->reqcount, blkif->reqmax, blkif->reqtime, jiffies, blkif->reqtick, j);
++}
+ 
+ /******************************************************************
+  * BLKTAP VM OPS
+@@ -969,6 +989,12 @@
+ 
+ 		if (log_stats && time_after(jiffies, blkif->st_print))
+ 			print_stats(blkif);
++
++                if (time_after(jiffies, blkif->reqtime) && 
++                    blkif->reqmax > 0 && 
++                    blkif->reqfill > 0 && 
++                    blkif->reqtick > 0)
++                               refill_reqcount(blkif);
+ 	}
+ 
+ 	if (log_stats)
+@@ -1113,6 +1139,9 @@
+ 		return 0;
+ 	}
+ 
++        if (blkif->reqcount <= 0 && blkif->reqmax > 0 && blkif->reqfill > 0)
++                  return (rc != rp) ? 1 : 0;
++
+ 	while (rc != rp) {
+ 		
+ 		if (RING_FULL(&info->ufe_ring)) {
+@@ -1128,6 +1157,16 @@
+ 			break;		
+ 		}
+ 
++                if (blkif->reqmax > 0 && 
++                    blkif->reqfill > 0 && 
++                    blkif->reqtick > 0) {
++                        if (blkif->reqcount <= 0) {
++                                more_to_do = 1;
++                                break;
++                        }
++                        --blkif->reqcount;
++                }
++
+ 		pending_req = alloc_req();
+ 		if (NULL == pending_req) {
+ 			blkif->st_oo_req++;
+diff -ur linux-2.6.18.x86_64-o/drivers/xen/blktap/common.h linux-2.6.18.x86_64/drivers/xen/blktap/common.h
+--- linux-2.6.18.x86_64-o/drivers/xen/blktap/common.h	2010-03-24 15:24:19.000000000 +0300
++++ linux-2.6.18.x86_64/drivers/xen/blktap/common.h	2010-03-25 20:11:38.000000000 +0300
+@@ -47,6 +47,10 @@
+ 
+ #define WPRINTK(fmt, args...) printk(KERN_WARNING "blk_tap: " fmt, ##args)
+ 
++#ifndef USHRT_MAX
++#define USHRT_MAX 0xffff
++#endif
++
+ struct backend_info;
+ 
+ typedef struct blkif_st {
+@@ -86,6 +90,13 @@
+ 	
+ 	int		dev_num;
+ 	uint64_t        sectors;
++
++        /* qos information */
++        ulong                   reqtime;
++        int                     reqcount;
++        unsigned char           reqtick;
++        unsigned short          reqmax;
++        unsigned short          reqfill;
+ } blkif_t;
+ 
+ blkif_t *tap_alloc_blkif(domid_t domid);
+diff -ur linux-2.6.18.x86_64-o/drivers/xen/blktap/xenbus.c linux-2.6.18.x86_64/drivers/xen/blktap/xenbus.c
+--- linux-2.6.18.x86_64-o/drivers/xen/blktap/xenbus.c	2010-03-24 15:24:19.000000000 +0300
++++ linux-2.6.18.x86_64/drivers/xen/blktap/xenbus.c	2010-03-25 20:32:09.000000000 +0300
+@@ -129,12 +129,127 @@
+ 	}								\
+ 	static DEVICE_ATTR(name, S_IRUGO, show_##name, NULL)
+ 
++/****************************************************************
++ * QoS interface for VBD  
++ */
++
++static ssize_t vbd_limit_ret (int *var, const char *page, size_t count)
++{
++        char *p = (char *) page;
++        *var = simple_strtoul(p, &p, 10);
++        return count;
++}
++
++static ssize_t store_reqtick(struct device *_dev,
++                     struct device_attribute *attr,
++                     const char *buf,
++                     size_t count)
++{
++                struct xenbus_device *dev = to_xenbus_device(_dev);
++                struct backend_info *be = dev->dev.driver_data;
++                int new_val;
++                int ret = vbd_limit_ret(&new_val, (buf), count);
++                if(new_val < 1)
++                        return -EINVAL;
++                if(new_val > 255)
++                       new_val = 255;
++                be->blkif->reqtick = new_val;
++                return ret;
++}
++
++static ssize_t store_reqfill(struct device *_dev,
++                     struct device_attribute *attr,
++                     const char *buf,
++                     size_t count)
++{
++                struct xenbus_device *dev = to_xenbus_device(_dev);
++                struct backend_info *be = dev->dev.driver_data;
++                int new_val;
++                int ret = vbd_limit_ret(&new_val, (buf), count);
++                if(new_val < 0)
++                        return -EINVAL;
++                if(new_val > USHRT_MAX)
++                        new_val = USHRT_MAX;
++                if(new_val > be->blkif->reqmax)
++                       new_val = be->blkif->reqmax;
++                be->blkif->reqfill = new_val;
++                return ret;
++} 
++
++static ssize_t store_reqmax(struct device *_dev,
++                     struct device_attribute *attr,
++                     const char *buf,
++                     size_t count)
++{
++                struct xenbus_device *dev = to_xenbus_device(_dev);
++                struct backend_info *be = dev->dev.driver_data;
++                int new_val;
++                int ret = vbd_limit_ret(&new_val, (buf), count);
++                if(new_val < 0)
++                        return -EINVAL;
++                if(new_val > USHRT_MAX)
++                        new_val = USHRT_MAX;
++                be->blkif->reqmax = new_val;
++                return ret;
++} 
++
++static ssize_t store_reqcount(struct device *_dev,
++                     struct device_attribute *attr,
++                     const char *buf,
++                     size_t count)
++{
++                struct xenbus_device *dev = to_xenbus_device(_dev);
++                struct backend_info *be = dev->dev.driver_data;
++                int new_val;
++                int ret = vbd_limit_ret(&new_val, (buf), count);
++                if(new_val < 0)
++                        return -EINVAL;
++                if(new_val > USHRT_MAX)
++                        new_val = USHRT_MAX;
++                if(new_val > be->blkif->reqmax)
++                        new_val = be->blkif->reqmax;
++                be->blkif->reqcount = new_val;
++                return ret;
++}
++
++
++#define VBD_LIMIT(name, arg...)                                                \
++       static ssize_t                                                          \
++       show_##name(struct device *_dev,                                        \
++                   struct device_attribute *attr,                              \
++                   char *buf)                                                  \
++       {                                                                       \
++               struct xenbus_device *dev = to_xenbus_device(_dev);             \
++               struct backend_info *be = dev->dev.driver_data;                 \
++                                                                               \
++               return sprintf(buf, "%d\n", ##arg);                             \
++       }                                                                       \
++       static DEVICE_ATTR(name,  S_IRUGO | S_IWUSR, show_##name, store_##name)
++
++VBD_LIMIT(reqfill,  be->blkif->reqfill);
++VBD_LIMIT(reqmax,   be->blkif->reqmax);
++VBD_LIMIT(reqcount, be->blkif->reqcount);
++VBD_LIMIT(reqtick,  be->blkif->reqtick);
++
+ VBD_SHOW(oo_req,  "%d\n", be->blkif->st_oo_req);
+ VBD_SHOW(rd_req,  "%d\n", be->blkif->st_rd_req);
+ VBD_SHOW(wr_req,  "%d\n", be->blkif->st_wr_req);
+ VBD_SHOW(rd_sect, "%d\n", be->blkif->st_rd_sect);
+ VBD_SHOW(wr_sect, "%d\n", be->blkif->st_wr_sect);
+ 
++static struct attribute *taplimit_attrs[] = {
++        &dev_attr_reqfill.attr,
++        &dev_attr_reqmax.attr,
++        &dev_attr_reqcount.attr,
++        &dev_attr_reqtick.attr,
++        NULL
++};
++
++static struct attribute_group taplimit_group = {
++        .name = "limit",
++        .attrs = taplimit_attrs,
++};
++
+ static struct attribute *tapstat_attrs[] = {
+ 	&dev_attr_oo_req.attr,
+ 	&dev_attr_rd_req.attr,
+@@ -151,10 +266,11 @@
+ 
+ int xentap_sysfs_addif(struct xenbus_device *dev)
+ {
+-	int err;
++	int err, errl;
+ 	struct backend_info *be = dev->dev.driver_data;
+ 	err = sysfs_create_group(&dev->dev.kobj, &tapstat_group);
+-	if (!err)
++	errl = sysfs_create_group(&dev->dev.kobj, &taplimit_group);
++	if (!err && !errl)
+ 		be->group_added = 1;
+ 	return err;
+ }
+@@ -163,6 +279,7 @@
+ {
+ 	struct backend_info *be = dev->dev.driver_data;
+ 	sysfs_remove_group(&dev->dev.kobj, &tapstat_group);
++	sysfs_remove_group(&dev->dev.kobj, &taplimit_group);
+ 	be->group_added = 0;
+ }
+ 
+@@ -284,6 +401,57 @@
+ 	return err;
+ }
+ 
++static void blkback_read_limit(struct xenbus_transaction xbt, 
++                               struct xenbus_device *dev)
++{
++       struct backend_info *be = dev->dev.driver_data;
++
++       char *s, *e;
++       uint f, m, t;
++       char *ratestr;
++
++       be->blkif->reqfill = 0;
++       be->blkif->reqmax = 0;
++       be->blkif->reqtick = 1;
++
++       ratestr = xenbus_read(xbt, dev->nodename, "limit", NULL);
++       if (IS_ERR(ratestr))
++               return;
++
++       s = ratestr;
++       f = simple_strtoul(s, &e, 10);
++       if ((s == e) || (*e != ':'))
++               goto fail;
++
++        s = e + 1;
++        m = simple_strtoul(s, &e, 10);
++        if ((s == e) || (*e != ':'))
++                goto fail;
++       
++       s = e + 1;
++       t = simple_strtoul(s, &e, 10);
++       if ((s == e) || (*e != '\0'))
++               goto fail;
++       
++       if ((f > USHRT_MAX) || (m > USHRT_MAX) || (t > 255) ||
++           (f < 0) || (m < 0) || (t < 1) ||
++           (f > m))
++               goto fail;
++
++       be->blkif->reqfill = f;
++       be->blkif->reqmax = m;
++       be->blkif->reqtick = t;
++
++       kfree(ratestr);
++       return;
++
++fail:
++       printk(KERN_WARNING
++                       "Failed to parse I/O limit. "
++                       "I/O operations are unlimited. \n");
++       kfree(ratestr);
++}
++
+ 
+ /**
+  * Callback received when the user space code has placed the device
+@@ -315,6 +483,16 @@
+ 	err = xenbus_gather(XBT_NIL, dev->nodename, "sectors", "%llu", 
+ 			    &be->blkif->sectors, NULL);
+ 
++        blkback_read_limit(XBT_NIL, dev);
++
++        be->blkif->reqtime  = jiffies;
++        be->blkif->reqcount = be->blkif->reqmax;
++
++        printk(KERN_WARNING
++                "blktap: [%d] reqfil=%d reqmax=%d recount=%d reqtick=%d \n", be->blkif->domid,
++                                                                             be->blkif->reqfill, be->blkif->reqmax,
++                                                                             be->blkif->reqcount, be->blkif->reqtick);
++
+ 	/* Associate tap dev with domid*/
+ 	be->blkif->dev_num = dom_to_devid(be->blkif->domid, be->xenbus_id, 
+ 					  be->blkif);

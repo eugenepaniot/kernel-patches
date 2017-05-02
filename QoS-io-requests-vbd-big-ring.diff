@@ -1,0 +1,826 @@
+diff -ur linux-2.6.18.x86_64-o/drivers/xen/blkback/blkback.c linux-2.6.18.x86_64/drivers/xen/blkback/blkback.c
+--- linux-2.6.18.x86_64-o/drivers/xen/blkback/blkback.c	2010-03-24 15:24:15.000000000 +0300
++++ linux-2.6.18.x86_64/drivers/xen/blkback/blkback.c	2010-03-27 03:25:07.000000000 +0300
+@@ -53,7 +53,7 @@
+  * This will increase the chances of being able to write whole tracks.
+  * 64 should be enough to keep us competitive with Linux.
+  */
+-static int blkif_reqs = 64;
++static int blkif_reqs = 128;
+ module_param_named(reqs, blkif_reqs, int, 0);
+ MODULE_PARM_DESC(reqs, "Number of blkback requests to allocate");
+ 
+@@ -199,6 +199,27 @@
+ 	blkif->st_oo_req = 0;
+ }
+ 
++static void refill_reqcount(blkif_t *blkif)
++{
++	uint j = jiffies_to_msecs(jiffies - blkif->reqtime) / 1000;
++	if(!j)
++		j=1;
++
++	blkif->reqcount += blkif->reqfill * j ;
++	blkif->reqtime = jiffies + msecs_to_jiffies(1000 * blkif->reqtick);
++	if (blkif->reqcount > blkif->reqmax)
++		blkif->reqcount = blkif->reqmax;
++	if (blkif->reqfill > blkif->reqmax)
++		blkif->reqfill = blkif->reqmax;
++	if (blkif->reqtick > 255)
++		blkif->reqtick = 255;
++
++	if (debug_lvl)
++                printk(KERN_WARNING
++			"refill_reqcount [%s]: reqcount=%d reqmax=%d reqtime=%ld jiffies=%ld reqtick=%d difftime=%u \n", 
++			current->comm, blkif->reqcount, blkif->reqmax, blkif->reqtime, jiffies, blkif->reqtick, j);
++}
++
+ int blkif_schedule(void *arg)
+ {
+ 	blkif_t *blkif = arg;
+@@ -225,6 +246,11 @@
+ 
+ 		if (log_stats && time_after(jiffies, blkif->st_print))
+ 			print_stats(blkif);
++		if (time_after(jiffies, blkif->reqtime) && 
++		    blkif->reqmax > 0 && 
++		    blkif->reqfill > 0 && 
++		    blkif->reqtick > 0)
++                      		refill_reqcount(blkif);
+ 	}
+ 
+ 	if (log_stats)
+@@ -303,11 +329,24 @@
+ 	rp = blk_rings->common.sring->req_prod;
+ 	rmb(); /* Ensure we see queued requests up to 'rp'. */
+ 
++        if (blkif->reqcount <= 0 && blkif->reqmax > 0 && blkif->reqfill > 0)
++	           return (rc != rp) ? 1 : 0;
++
+ 	while ((rc != rp)) {
+ 
+ 		if (RING_REQUEST_CONS_OVERFLOW(&blk_rings->common, rc))
+ 			break;
+ 
++		if (blkif->reqmax > 0 && 
++		    blkif->reqfill > 0 && 
++		    blkif->reqtick > 0) {
++	                if (blkif->reqcount <= 0) {
++        	                more_to_do = 1;
++                	        break;
++	                }
++			--blkif->reqcount;
++		}
++
+ 		pending_req = alloc_req();
+ 		if (NULL == pending_req) {
+ 			blkif->st_oo_req++;
+Только в linux-2.6.18.x86_64/drivers/xen/blkback/: blkback.c.rej
+diff -ur linux-2.6.18.x86_64-o/drivers/xen/blkback/common.h linux-2.6.18.x86_64/drivers/xen/blkback/common.h
+--- linux-2.6.18.x86_64-o/drivers/xen/blkback/common.h	2010-03-24 15:24:15.000000000 +0300
++++ linux-2.6.18.x86_64/drivers/xen/blkback/common.h	2010-03-27 03:25:22.000000000 +0300
+@@ -47,6 +47,11 @@
+ 	pr_debug("(file=%s, line=%d) " _f,	\
+ 		 __FILE__ , __LINE__ , ## _a )
+ 
++#ifndef USHRT_MAX
++#define USHRT_MAX 0xffff
++#endif
++#define BLKIF_MAX_NUM_RING_PAGES 4
++
+ struct vbd {
+ 	blkif_vdev_t   handle;      /* what the domain refers to this vbd as */
+ 	unsigned char  readonly;    /* Non-zero -> read-only */
+@@ -91,14 +96,22 @@
+ 
+ 	wait_queue_head_t waiting_to_free;
+ 
+-	grant_handle_t shmem_handle;
+-	grant_ref_t    shmem_ref;
++	unsigned int   num_ring_pages;
++	grant_handle_t shmem_handle[BLKIF_MAX_NUM_RING_PAGES];
++	grant_ref_t    shmem_ref[BLKIF_MAX_NUM_RING_PAGES];
++
++        /* qos information */
++	ulong			reqtime;
++	int			reqcount;
++	unsigned short		reqtick;
++	unsigned short		reqmax;
++	unsigned short		reqfill;
+ } blkif_t;
+ 
+ blkif_t *blkif_alloc(domid_t domid);
+ void blkif_disconnect(blkif_t *blkif);
+ void blkif_free(blkif_t *blkif);
+-int blkif_map(blkif_t *blkif, unsigned long shared_page, unsigned int evtchn);
++int blkif_map(blkif_t *blkif, unsigned long *shared_pages, unsigned int evtchn);
+ 
+ #define blkif_get(_b) (atomic_inc(&(_b)->refcnt))
+ #define blkif_put(_b)					\
+diff -ur linux-2.6.18.x86_64-o/drivers/xen/blkback/interface.c linux-2.6.18.x86_64/drivers/xen/blkback/interface.c
+--- linux-2.6.18.x86_64-o/drivers/xen/blkback/interface.c	2010-03-24 15:24:19.000000000 +0300
++++ linux-2.6.18.x86_64/drivers/xen/blkback/interface.c	2010-03-27 04:04:13.000000000 +0300
+@@ -34,11 +34,14 @@
+ #include <xen/evtchn.h>
+ #include <linux/kthread.h>
+ 
++#define INVALID_GRANT_HANDLE ((grant_handle_t)~0U)
++
+ static kmem_cache_t *blkif_cachep;
+ 
+ blkif_t *blkif_alloc(domid_t domid)
+ {
+ 	blkif_t *blkif;
++	int i;
+ 
+ 	blkif = kmem_cache_alloc(blkif_cachep, GFP_KERNEL);
+ 	if (!blkif)
+@@ -52,60 +55,93 @@
+ 	blkif->st_print = jiffies;
+ 	init_waitqueue_head(&blkif->waiting_to_free);
+ 
++	for (i = 0; i < BLKIF_MAX_NUM_RING_PAGES; i++) {
++		blkif->shmem_handle[i] = INVALID_GRANT_HANDLE;
++	}
++
+ 	return blkif;
+ }
+ 
+-static int map_frontend_page(blkif_t *blkif, unsigned long shared_page)
++static void unmap_frontend_pages(blkif_t *blkif)
+ {
+-	struct gnttab_map_grant_ref op;
++	struct gnttab_unmap_grant_ref op[BLKIF_MAX_NUM_RING_PAGES];
++	int i, op_count = 0;
+ 	int ret;
+ 
+-	gnttab_set_map_op(&op, (unsigned long)blkif->blk_ring_area->addr,
+-			  GNTMAP_host_map, shared_page, blkif->domid);
++
++	for (i = 0; i < blkif->num_ring_pages; i++) {
++		if (blkif->shmem_handle[i] != INVALID_GRANT_HANDLE) {
++
++			unsigned long addr = (unsigned long)
++			blkif->blk_ring_area->addr + i * PAGE_SIZE;
++
++			gnttab_set_unmap_op(&op[op_count], addr,
++				    GNTMAP_host_map, 
++					    blkif->shmem_handle[i]);
++			blkif->shmem_handle[i] = INVALID_GRANT_HANDLE;
++			op_count++;
++		}
++	}
+ 
+ 	lock_vm_area(blkif->blk_ring_area);
+-	ret = HYPERVISOR_grant_table_op(GNTTABOP_map_grant_ref, &op, 1);
++	ret = HYPERVISOR_grant_table_op(GNTTABOP_unmap_grant_ref, op, 1);
+ 	unlock_vm_area(blkif->blk_ring_area);
+ 	BUG_ON(ret);
++}
++
++static int map_frontend_pages(blkif_t *blkif, unsigned long *shared_pages)
++{
++	struct gnttab_map_grant_ref op[BLKIF_MAX_NUM_RING_PAGES];
++	int i, ret_val = 0;
++
++	for (i = 0; i < blkif->num_ring_pages; i++) {
++		unsigned long addr = (unsigned long)
++			blkif->blk_ring_area->addr + i * PAGE_SIZE;
+ 
+-	if (op.status) {
+-		DPRINTK(" Grant table operation failure !\n");
+-		return op.status;
++		gnttab_set_map_op(&op[i], addr, GNTMAP_host_map, 
++				  shared_pages[i], blkif->domid);
+ 	}
+ 
+-	blkif->shmem_ref = shared_page;
+-	blkif->shmem_handle = op.handle;
++	if (HYPERVISOR_grant_table_op(GNTTABOP_map_grant_ref, 
++				      op, blkif->num_ring_pages))
++		BUG();
+ 
+-	return 0;
+-}
++	for (i = 0; i < blkif->num_ring_pages; i++) {
+ 
+-static void unmap_frontend_page(blkif_t *blkif)
+-{
+-	struct gnttab_unmap_grant_ref op;
+-	int ret;
++		if (op[i].status) {
++			DPRINTK(" Grant table operation failure !\n");
+ 
+-	gnttab_set_unmap_op(&op, (unsigned long)blkif->blk_ring_area->addr,
+-			    GNTMAP_host_map, blkif->shmem_handle);
++			/*record first error code*/
++			if (!ret_val)
++				ret_val = op[i].status;
++		} else {
++			blkif->shmem_ref[i] = shared_pages[i];
++			blkif->shmem_handle[i] = op[i].handle;
++		}
++	}
+ 
+-	lock_vm_area(blkif->blk_ring_area);
+-	ret = HYPERVISOR_grant_table_op(GNTTABOP_unmap_grant_ref, &op, 1);
+-	unlock_vm_area(blkif->blk_ring_area);
+-	BUG_ON(ret);
++	/*if one of the mapping failed, unmap all grants*/
++	if (ret_val)
++		unmap_frontend_pages(blkif);
++
++	return ret_val;
+ }
+ 
+-int blkif_map(blkif_t *blkif, unsigned long shared_page, unsigned int evtchn)
++
++int blkif_map(blkif_t *blkif, unsigned long *shared_pages, unsigned int evtchn)
+ {
+ 	int err;
++	unsigned long ring_area_size = BLKIF_MAX_NUM_RING_PAGES * PAGE_SIZE;
+ 	struct evtchn_bind_interdomain bind_interdomain;
+ 
+ 	/* Already connected through? */
+ 	if (blkif->irq)
+ 		return 0;
+ 
+-	if ( (blkif->blk_ring_area = alloc_vm_area(PAGE_SIZE)) == NULL )
++	if ( (blkif->blk_ring_area = alloc_vm_area(ring_area_size)) == NULL )
+ 		return -ENOMEM;
+ 
+-	err = map_frontend_page(blkif, shared_page);
++	err = map_frontend_pages(blkif, shared_pages);
+ 	if (err) {
+ 		free_vm_area(blkif->blk_ring_area);
+ 		return err;
+@@ -117,7 +153,7 @@
+ 	err = HYPERVISOR_event_channel_op(EVTCHNOP_bind_interdomain,
+ 					  &bind_interdomain);
+ 	if (err) {
+-		unmap_frontend_page(blkif);
++		unmap_frontend_pages(blkif);
+ 		free_vm_area(blkif->blk_ring_area);
+ 		return err;
+ 	}
+@@ -129,21 +165,21 @@
+ 	{
+ 		blkif_sring_t *sring;
+ 		sring = (blkif_sring_t *)blkif->blk_ring_area->addr;
+-		BACK_RING_INIT(&blkif->blk_rings.native, sring, PAGE_SIZE);
++		BACK_RING_INIT(&blkif->blk_rings.native, sring, ring_area_size);
+ 		break;
+ 	}
+ 	case BLKIF_PROTOCOL_X86_32:
+ 	{
+ 		blkif_x86_32_sring_t *sring_x86_32;
+ 		sring_x86_32 = (blkif_x86_32_sring_t *)blkif->blk_ring_area->addr;
+-		BACK_RING_INIT(&blkif->blk_rings.x86_32, sring_x86_32, PAGE_SIZE);
++		BACK_RING_INIT(&blkif->blk_rings.x86_32, sring_x86_32, ring_area_size);
+ 		break;
+ 	}
+ 	case BLKIF_PROTOCOL_X86_64:
+ 	{
+ 		blkif_x86_64_sring_t *sring_x86_64;
+ 		sring_x86_64 = (blkif_x86_64_sring_t *)blkif->blk_ring_area->addr;
+-		BACK_RING_INIT(&blkif->blk_rings.x86_64, sring_x86_64, PAGE_SIZE);
++		BACK_RING_INIT(&blkif->blk_rings.x86_64, sring_x86_64, ring_area_size);
+ 		break;
+ 	}
+ 	default:
+@@ -154,7 +190,7 @@
+ 		blkif->evtchn, blkif_be_int, 0, "blkif-backend", blkif);
+ 
+         if (err < 0) {
+- 		unmap_frontend_page(blkif);
++ 		unmap_frontend_pages(blkif);
+ 		free_vm_area(blkif->blk_ring_area);
+ 		blkif->blk_rings.common.sring = NULL;
+ 		return err;
+@@ -181,7 +217,7 @@
+ 	}
+ 
+ 	if (blkif->blk_rings.common.sring) {
+-		unmap_frontend_page(blkif);
++		unmap_frontend_pages(blkif);
+ 		free_vm_area(blkif->blk_ring_area);
+ 		blkif->blk_rings.common.sring = NULL;
+ 	}
+@@ -196,6 +232,9 @@
+ 
+ void __init blkif_interface_init(void)
+ {
++	printk(KERN_DEBUG
++			"blkback supports up to %d pages ring\n", BLKIF_MAX_NUM_RING_PAGES);
++
+ 	blkif_cachep = kmem_cache_create("blkif_cache", sizeof(blkif_t), 
+ 					 0, 0, NULL, NULL);
+ }
+diff -ur linux-2.6.18.x86_64-o/drivers/xen/blkback/xenbus.c linux-2.6.18.x86_64/drivers/xen/blkback/xenbus.c
+--- linux-2.6.18.x86_64-o/drivers/xen/blkback/xenbus.c	2010-03-24 15:24:15.000000000 +0300
++++ linux-2.6.18.x86_64/drivers/xen/blkback/xenbus.c	2010-03-27 03:47:53.000000000 +0300
+@@ -112,6 +112,108 @@
+ 	}								\
+ 	static DEVICE_ATTR(name, S_IRUGO, show_##name, NULL)
+ 
++/****************************************************************
++ * QoS interface for VBD  
++ */
++
++static ssize_t vbd_limit_ret (int *var, const char *page, size_t count)
++{
++        char *p = (char *) page;
++        *var = simple_strtoul(p, &p, 10);
++        return count;
++}
++
++static ssize_t store_reqtick(struct device *_dev,
++                     struct device_attribute *attr,
++                     const char *buf,
++                     size_t count)
++{
++                struct xenbus_device *dev = to_xenbus_device(_dev);
++                struct backend_info *be = dev->dev.driver_data;
++                int new_val;
++                int ret = vbd_limit_ret(&new_val, (buf), count);
++                if(new_val < 1)
++                        return -EINVAL;
++		if(new_val > 255)
++			new_val = 255;
++                be->blkif->reqtick = new_val;
++                return ret;
++}
++
++static ssize_t store_reqfill(struct device *_dev,
++                     struct device_attribute *attr,
++                     const char *buf,
++                     size_t count)
++{
++                struct xenbus_device *dev = to_xenbus_device(_dev);
++                struct backend_info *be = dev->dev.driver_data;
++                int new_val;
++                int ret = vbd_limit_ret(&new_val, (buf), count);
++		if(new_val < 0)
++                        return -EINVAL;
++                if(new_val > USHRT_MAX)
++                        new_val = USHRT_MAX;
++		if(new_val > be->blkif->reqmax)
++			new_val = be->blkif->reqmax;
++                be->blkif->reqfill = new_val;
++                return ret;
++} 
++
++static ssize_t store_reqmax(struct device *_dev,
++                     struct device_attribute *attr,
++                     const char *buf,
++                     size_t count)
++{
++                struct xenbus_device *dev = to_xenbus_device(_dev);
++                struct backend_info *be = dev->dev.driver_data;
++                int new_val;
++                int ret = vbd_limit_ret(&new_val, (buf), count);
++		if(new_val < 0)
++                        return -EINVAL;
++                if(new_val > USHRT_MAX)
++                        new_val = USHRT_MAX;
++                be->blkif->reqmax = new_val;
++                return ret;
++} 
++
++static ssize_t store_reqcount(struct device *_dev,
++                     struct device_attribute *attr,
++                     const char *buf,
++                     size_t count)
++{
++                struct xenbus_device *dev = to_xenbus_device(_dev);
++                struct backend_info *be = dev->dev.driver_data;
++                int new_val;
++                int ret = vbd_limit_ret(&new_val, (buf), count);
++		if(new_val < 0)
++                        return -EINVAL;
++                if(new_val > USHRT_MAX)
++                        new_val = USHRT_MAX;
++		if(new_val > be->blkif->reqmax)
++                        new_val = be->blkif->reqmax;
++                be->blkif->reqcount = new_val;
++                return ret;
++}
++
++
++#define VBD_LIMIT(name, arg...)							\
++	static ssize_t 								\
++	show_##name(struct device *_dev,					\
++		    struct device_attribute *attr, 				\
++		    char *buf) 							\
++	{									\
++		struct xenbus_device *dev = to_xenbus_device(_dev);		\
++	        struct backend_info *be = dev->dev.driver_data;			\
++										\
++		return sprintf(buf, "%d\n", ##arg);				\
++	}									\
++	static DEVICE_ATTR(name,  S_IRUGO | S_IWUSR, show_##name, store_##name)
++
++VBD_LIMIT(reqfill,  be->blkif->reqfill);
++VBD_LIMIT(reqmax,   be->blkif->reqmax);
++VBD_LIMIT(reqcount, be->blkif->reqcount);
++VBD_LIMIT(reqtick,  be->blkif->reqtick);
++
+ VBD_SHOW(oo_req,  "%d\n", be->blkif->st_oo_req);
+ VBD_SHOW(rd_req,  "%d\n", be->blkif->st_rd_req);
+ VBD_SHOW(wr_req,  "%d\n", be->blkif->st_wr_req);
+@@ -132,6 +234,19 @@
+ 	.attrs = vbdstat_attrs,
+ };
+ 
++static struct attribute *vbdlimit_attrs[] = {
++	&dev_attr_reqfill.attr,
++	&dev_attr_reqmax.attr,
++	&dev_attr_reqcount.attr,
++	&dev_attr_reqtick.attr,
++	NULL
++};
++
++static struct attribute_group vbdlimit_group = {
++        .name = "limit",
++        .attrs = vbdlimit_attrs,
++};
++
+ VBD_SHOW(physical_device, "%x:%x\n", be->major, be->minor);
+ VBD_SHOW(mode, "%s\n", be->mode);
+ 
+@@ -147,12 +262,17 @@
+ 	if (error)
+ 		goto fail2;
+ 
+-	error = sysfs_create_group(&dev->dev.kobj, &vbdstat_group);
+-	if (error)
+-		goto fail3;
++        error = sysfs_create_group(&dev->dev.kobj, &vbdstat_group);
++        if (error)
++                goto fail3;
++
++	error = sysfs_create_group(&dev->dev.kobj, &vbdlimit_group);
++        if (error)
++                goto fail4;
+ 
+ 	return 0;
+ 
++fail4:  sysfs_remove_group(&dev->dev.kobj, &vbdlimit_group);
+ fail3:	sysfs_remove_group(&dev->dev.kobj, &vbdstat_group);
+ fail2:	device_remove_file(&dev->dev, &dev_attr_mode);
+ fail1:	device_remove_file(&dev->dev, &dev_attr_physical_device);
+@@ -162,6 +282,7 @@
+ void xenvbd_sysfs_delif(struct xenbus_device *dev)
+ {
+ 	sysfs_remove_group(&dev->dev.kobj, &vbdstat_group);
++	sysfs_remove_group(&dev->dev.kobj, &vbdlimit_group);
+ 	device_remove_file(&dev->dev, &dev_attr_mode);
+ 	device_remove_file(&dev->dev, &dev_attr_physical_device);
+ }
+@@ -241,6 +362,57 @@
+ 	return err;
+ }
+ 
++static void blkback_read_limit(struct xenbus_transaction xbt, 
++				struct xenbus_device *dev)
++{
++	struct backend_info *be = dev->dev.driver_data;
++
++	char *s, *e;
++	uint f, m, t;
++	char *ratestr;
++
++	be->blkif->reqfill = 0;
++	be->blkif->reqmax = 0;
++	be->blkif->reqtick = 1;
++
++	ratestr = xenbus_read(xbt, dev->nodename, "limit", NULL);
++	if (IS_ERR(ratestr))
++		return;
++
++	s = ratestr;
++	f = simple_strtoul(s, &e, 10);
++	if ((s == e) || (*e != ':'))
++		goto fail;
++
++        s = e + 1;
++        m = simple_strtoul(s, &e, 10);
++        if ((s == e) || (*e != ':'))
++                goto fail;
++	
++	s = e + 1;
++	t = simple_strtoul(s, &e, 10);
++	if ((s == e) || (*e != '\0'))
++		goto fail;
++	
++	if ((f > USHRT_MAX) || (m > USHRT_MAX) || (t > 255) ||
++	    (f < 0) || (m < 0) || (t < 1) ||
++	    (f > m))
++		goto fail;
++
++	be->blkif->reqfill = f;
++	be->blkif->reqmax = m;
++	be->blkif->reqtick = t;
++
++	kfree(ratestr);
++	return;
++
++fail:
++	printk(KERN_WARNING
++			"Failed to parse I/O limit. "
++			"I/O operations are unlimited. \n");
++	kfree(ratestr);
++}
++
+ 
+ /**
+  * Callback received when the hotplug scripts have placed the physical-device
+@@ -289,6 +461,16 @@
+ 		return;
+ 	}
+ 
++	blkback_read_limit(XBT_NIL, dev);
++
++        be->blkif->reqtime  = jiffies;
++        be->blkif->reqcount = be->blkif->reqmax;
++
++        printk(KERN_WARNING
++                "blkback: [%d] reqfil=%d reqmax=%d recount=%d reqtick=%d \n", be->blkif->domid,
++                                                                              be->blkif->reqfill, be->blkif->reqmax,
++                                                                              be->blkif->reqcount, be->blkif->reqtick);
++
+ 	if (be->major == 0 && be->minor == 0) {
+ 		/* Front end dir is a number, which is used as the handle. */
+ 
+@@ -444,18 +626,68 @@
+ static int connect_ring(struct backend_info *be)
+ {
+ 	struct xenbus_device *dev = be->dev;
+-	unsigned long ring_ref;
++	unsigned long ring_ref[BLKIF_MAX_NUM_RING_PAGES];
+ 	unsigned int evtchn;
+ 	char protocol[64] = "";
+-	int err;
++	int err, i;
+ 
+ 	DPRINTK("%s", dev->otherend);
+ 
+-	err = xenbus_gather(XBT_NIL, dev->otherend, "ring-ref", "%lu", &ring_ref,
+-			    "event-channel", "%u", &evtchn, NULL);
++	/*try one page ring handshake first*/
++	err = xenbus_gather(XBT_NIL, dev->otherend, 
++			    "ring-ref", "%lu", &ring_ref[0],
++			    NULL);
++	    
++	/*if reading a single page failed, try multi-page ring handshake*/
++	if (err) {
++		unsigned int num_ring_pages;
++
++		/*read the number of pages*/
++		err = xenbus_gather(XBT_NIL, dev->otherend,
++				    "num-ring-pages", "%u", &num_ring_pages,
++				    NULL);
++		if (err) {
++			xenbus_dev_fatal(dev, err,
++					 "reading ring-ref or num-ring_pages");
++			return err;
++		}
++
++		/*sanity check the number of pages*/
++		if (num_ring_pages != 2 && num_ring_pages != 4) {
++			xenbus_dev_fatal(dev, -EINVAL, 
++					 "invalid value for num-ring-pages");
++			return -1;
++		}
++
++		be->blkif->num_ring_pages = num_ring_pages;
++
++		for (i = 0; i < num_ring_pages; i++) {
++			char buf[10];
++			snprintf(buf, sizeof(buf), "ring-ref%d", i);
++			err = xenbus_gather(XBT_NIL, dev->otherend, buf, 
++					    "%lu", &ring_ref[i],
++					    NULL);
++			if (err) {
++				xenbus_dev_fatal(dev, err,
++						 "reading %s/%s", 
++						 dev->otherend, buf);
++				return err;
++			}
++		}
++
++		printk(KERN_INFO "Setting up ring with %d pages\n", num_ring_pages);
++	} else {
++		printk(KERN_INFO "Setting up single page ring\n");
++		be->blkif->num_ring_pages = 1;
++	}
++
++	err = xenbus_gather(XBT_NIL, dev->otherend,
++			    "event-channel", "%u", &evtchn, 
++			    NULL);
++
+ 	if (err) {
+ 		xenbus_dev_fatal(dev, err,
+-				 "reading %s/ring-ref and event-channel",
++				"reading %s/event-channel",
+ 				 dev->otherend);
+ 		return err;
+ 	}
+@@ -475,14 +707,22 @@
+ 		xenbus_dev_fatal(dev, err, "unknown fe protocol %s", protocol);
+ 		return -1;
+ 	}
+-	printk("blkback: ring-ref %ld, event-channel %d, protocol %d (%s)\n",
+-	       ring_ref, evtchn, be->blkif->blk_protocol, protocol);
++
++	printk(KERN_WARNING 
++			"blkback: ");
++	for (i = 0; i < be->blkif->num_ring_pages; i++) {
++		printk(KERN_WARNING 
++			" ring-ref '%d' : '%ld', ", i, ring_ref[i]);
++	}
++	printk(KERN_WARNING 
++			" event-channel : '%d', protocol %d (%s)\n",
++		         evtchn, be->blkif->blk_protocol, protocol);
+ 
+ 	/* Map the shared frame, irq etc. */
+ 	err = blkif_map(be->blkif, ring_ref, evtchn);
+ 	if (err) {
+-		xenbus_dev_fatal(dev, err, "mapping ring-ref %lu port %u",
+-				 ring_ref, evtchn);
++		xenbus_dev_fatal(dev, err, 
++				 "mapping ring-refs and port %u", evtchn);
+ 		return err;
+ 	}
+ 
+diff -ur linux-2.6.18.x86_64-o/drivers/xen/blkfront/blkfront.c linux-2.6.18.x86_64/drivers/xen/blkfront/blkfront.c
+--- linux-2.6.18.x86_64-o/drivers/xen/blkfront/blkfront.c	2010-03-24 15:24:20.000000000 +0300
++++ linux-2.6.18.x86_64/drivers/xen/blkfront/blkfront.c	2010-03-27 03:19:56.000000000 +0300
+@@ -160,7 +160,14 @@
+ {
+ 	const char *message = NULL;
+ 	struct xenbus_transaction xbt;
+-	int err;
++	int err, i;
++
++	BUG_ON(BLK_NUM_RING_PAGES != 1 && 
++	       BLK_NUM_RING_PAGES != 2 && 
++	       BLK_NUM_RING_PAGES != 4);
++
++	 printk(KERN_WARNING
++			"blkfront: setting up %d pages ring \n", BLK_NUM_RING_PAGES);
+ 
+ 	/* Create shared ring, alloc event channel. */
+ 	err = setup_blkring(dev, info);
+@@ -168,17 +175,46 @@
+ 		goto out;
+ 
+ again:
++	printk(KERN_WARNING
++			"blkring xenbus transaction \n");
+ 	err = xenbus_transaction_start(&xbt);
+ 	if (err) {
+ 		xenbus_dev_fatal(dev, err, "starting transaction");
+ 		goto destroy_blkring;
+ 	}
+ 
+-	err = xenbus_printf(xbt, dev->nodename,
+-			    "ring-ref","%u", info->ring_ref);
+-	if (err) {
+-		message = "writing ring-ref";
+-		goto abort_transaction;
++	if (BLK_NUM_RING_PAGES == 1) {
++		/*use backward compatible handshake for 1 page ring*/
++		err = xenbus_printf(xbt, dev->nodename,
++				    "ring-ref","%u", info->ring_ref[0]);
++		if (err) {
++			message = "writing ring-ref";
++			goto abort_transaction;
++		}
++
++	} else {
++		/*use new handshake for 2 and 4 pages ring*/
++		err = xenbus_printf(xbt, dev->nodename,
++				    "num-ring-pages", 
++				    "%u", BLK_NUM_RING_PAGES);
++
++		if (err) {
++			message = "writing num-ring-pages";
++			goto abort_transaction;
++		}
++
++		for (i = 0; i < BLK_NUM_RING_PAGES; i++) {
++			char buf[10];
++			snprintf(buf, sizeof(buf), "ring-ref%d", i);
++			err = xenbus_printf(xbt, dev->nodename,
++					    buf, "%u", info->ring_ref[i]);
++			if (err) {
++				message = "writing ring-refs";
++				goto abort_transaction;
++			}
++
++		}
++
+ 	}
+ 	err = xenbus_printf(xbt, dev->nodename,
+ 			    "event-channel", "%u", info->evtchn);
+@@ -220,25 +256,32 @@
+ 			 struct blkfront_info *info)
+ {
+ 	blkif_sring_t *sring;
+-	int err;
++	int i, order, err;
+ 
+-	info->ring_ref = GRANT_INVALID_REF;
++	for (i = 0; i < BLK_NUM_RING_PAGES; i++)
++		info->ring_ref[i] = GRANT_INVALID_REF;
+ 
+-	sring = (blkif_sring_t *)__get_free_page(GFP_NOIO| __GFP_HIGH);
++	order = get_order(BLK_RING_AREA_SIZE);
++	sring = (blkif_sring_t *)__get_free_pages(GFP_KERNEL, order);
+ 	if (!sring) {
+ 		xenbus_dev_fatal(dev, -ENOMEM, "allocating shared ring");
+ 		return -ENOMEM;
+ 	}
+ 	SHARED_RING_INIT(sring);
+-	FRONT_RING_INIT(&info->ring, sring, PAGE_SIZE);
++	FRONT_RING_INIT(&info->ring, sring, BLK_RING_AREA_SIZE);
+ 
+-	err = xenbus_grant_ring(dev, virt_to_mfn(info->ring.sring));
+-	if (err < 0) {
+-		free_page((unsigned long)sring);
+-		info->ring.sring = NULL;
+-		goto fail;
++	for (i = 0; i < BLK_NUM_RING_PAGES; i++) {
++		unsigned long addr = 
++			(unsigned long)info->ring.sring + i * PAGE_SIZE;
++
++		err = xenbus_grant_ring(dev, virt_to_mfn(addr));
++		if (err < 0) {
++			free_pages((unsigned long)sring, order);
++			info->ring.sring = NULL;
++			goto fail;
++		}
++		info->ring_ref[i] = err;
+ 	}
+-	info->ring_ref = err;
+ 
+ 	err = xenbus_alloc_evtchn(dev, &info->evtchn);
+ 	if (err)
+@@ -719,6 +762,8 @@
+ 
+ static void blkif_free(struct blkfront_info *info, int suspend)
+ {
++	int i;
++
+ 	/* Prevent new requests being issued until we fix things up. */
+ 	spin_lock_irq(&blkif_io_lock);
+ 	info->connected = suspend ?
+@@ -734,12 +779,18 @@
+ 	flush_scheduled_work();
+ 
+ 	/* Free resources associated with old device channel. */
+-	if (info->ring_ref != GRANT_INVALID_REF) {
+-		gnttab_end_foreign_access(info->ring_ref, 0,
+-					  (unsigned long)info->ring.sring);
+-		info->ring_ref = GRANT_INVALID_REF;
+-		info->ring.sring = NULL;
++	for (i = 0; i < BLK_NUM_RING_PAGES; i++) {
++		
++		if (info->ring_ref[i] != GRANT_INVALID_REF) {
++			gnttab_end_foreign_access(info->ring_ref[i], 0, 0UL); 
++			info->ring_ref[i] = GRANT_INVALID_REF;
++			info->ring.sring = NULL;
++		}
+ 	}
++	if (info->ring.sring)
++		free_pages((unsigned long)info->ring.sring,
++			   get_order(BLK_RING_AREA_SIZE));
++
+ 	if (info->irq)
+ 		unbind_from_irqhandler(info->irq, info);
+ 	info->evtchn = info->irq = 0;
+diff -ur linux-2.6.18.x86_64-o/drivers/xen/blkfront/block.h linux-2.6.18.x86_64/drivers/xen/blkfront/block.h
+--- linux-2.6.18.x86_64-o/drivers/xen/blkfront/block.h	2010-03-24 15:24:20.000000000 +0300
++++ linux-2.6.18.x86_64/drivers/xen/blkfront/block.h	2010-03-27 03:03:12.000000000 +0300
+@@ -101,7 +101,10 @@
+ 	unsigned long frame[BLKIF_MAX_SEGMENTS_PER_REQUEST];
+ };
+ 
+-#define BLK_RING_SIZE __RING_SIZE((blkif_sring_t *)0, PAGE_SIZE)
++#define BLK_NUM_RING_PAGES 4
++#define BLK_RING_AREA_SIZE (BLK_NUM_RING_PAGES * PAGE_SIZE)
++#define BLK_RING_SIZE __RING_SIZE((blkif_sring_t *)0, BLK_RING_AREA_SIZE)
++#define BLKIF_MAX_NUM_RING_PAGES 4
+ 
+ /*
+  * We have one of these per vbd, whether ide, scsi or 'other'.  They
+@@ -116,7 +119,7 @@
+ 	int vdevice;
+ 	blkif_vdev_t handle;
+ 	int connected;
+-	int ring_ref;
++	int ring_ref[BLK_NUM_RING_PAGES];
+ 	blkif_front_ring_t ring;
+ 	struct scatterlist sg[BLKIF_MAX_SEGMENTS_PER_REQUEST];
+ 	unsigned int evtchn, irq;

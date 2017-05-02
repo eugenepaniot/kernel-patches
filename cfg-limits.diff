@@ -1,0 +1,56 @@
+Только в xen-3.3.3-p/tools/python/xen/util/xsm: xsm.py
+diff -ur xen-3.3.3-o/tools/python/xen/xend/server/blkif.py xen-3.3.3-p/tools/python/xen/xend/server/blkif.py
+--- xen-3.3.3-o/tools/python/xen/xend/server/blkif.py	2010-03-09 17:56:38.000000000 +0300
++++ xen-3.3.3-p/tools/python/xen/xend/server/blkif.py	2010-03-27 03:54:13.000000000 +0300
+@@ -79,6 +79,10 @@
+                 'mode'   : mode,
+                 }
+ 
++        limit = config.get('limit', '')
++        if limit:
++            back['limit'] = limit
++
+         uuid = config.get('uuid')
+         if uuid:
+             back['uuid'] = uuid
+diff -ur xen-3.3.3-o/tools/python/xen/xm/create.py xen-3.3.3-p/tools/python/xen/xm/create.py
+--- xen-3.3.3-o/tools/python/xen/xm/create.py	2010-03-09 17:50:18.000000000 +0300
++++ xen-3.3.3-p/tools/python/xen/xm/create.py	2010-03-24 16:37:43.000000000 +0300
+@@ -304,7 +304,7 @@
+           fn=append_value, default=0,
+           use="Make the domain a TPM interface backend.")
+ 
+-gopts.var('disk', val='phy:DEV,VDEV,MODE[,DOM]',
++gopts.var('disk', val='phy:DEV,VDEV[,MODE[,DOM]]',
+           fn=append_value, default=[],
+           use="""Add a disk device to a domain. The physical device is DEV,
+           which is exported to the domain as VDEV. The disk is read-only if MODE
+@@ -641,7 +641,7 @@
+ def configure_disks(config_devs, vals):
+     """Create the config for disks (virtual block devices).
+     """
+-    for (uname, dev, mode, backend, protocol) in vals.disk:
++    for (uname, dev, mode, limit, backend, protocol) in vals.disk:
+         if uname.startswith('tap:'):
+             cls = 'tap'
+         else:
+@@ -651,6 +651,8 @@
+                       ['uname', uname],
+                       ['dev', dev ],
+                       ['mode', mode ] ]
++	if limit:
++	   config_vbd.append(['limit', limit])
+         if backend:
+             config_vbd.append(['backend', backend])
+         if protocol:
+@@ -949,7 +951,10 @@
+             d.append(None)
+         elif n == 4:
+             d.append(None)
++            d.append(None)
+         elif n == 5:
++            d.append(None)
++	elif n == 6:
+             pass
+         else:
+             err('Invalid disk specifier: ' + v)

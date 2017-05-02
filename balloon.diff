@@ -1,0 +1,601 @@
+--- linux-2.6.18.i686-orig/fs/proc/proc_misc.c	2010-08-03 18:09:16.000000000 +0400
++++ linux-2.6.18.i686-p/fs/proc/proc_misc.c	2010-08-04 18:12:19.000000000 +0400
+@@ -67,6 +67,8 @@
+ extern int get_dma_list(char *);
+ extern int get_locks_status (char *, char **, off_t, int);
+ 
++extern unsigned long current_max_pages;
++
+ static int proc_calc_metrics(char *page, char **start, off_t off,
+ 				 int count, int *eof, int len)
+ {
+@@ -176,7 +178,7 @@
+ 		"VmallocTotal: %8lu kB\n"
+ 		"VmallocUsed:  %8lu kB\n"
+ 		"VmallocChunk: %8lu kB\n",
+-		K(i.totalram),
++		K(current_max_pages),
+ 		K(i.freeram),
+ 		K(i.bufferram),
+ 		K(cached),
+--- linux-2.6.18.i686-orig/drivers/xen/balloon/balloon.c	2010-08-03 18:09:18.000000000 +0400
++++ linux-2.6.18.i686-p/drivers/xen/balloon/balloon.c	2010-08-06 14:17:40.000000000 +0400
+@@ -44,6 +44,7 @@
+ #include <linux/bootmem.h>
+ #include <linux/highmem.h>
+ #include <linux/vmalloc.h>
++#include <linux/syscalls.h>
+ #include <xen/xen_proc.h>
+ #include <asm/hypervisor.h>
+ #include <xen/balloon.h>
+@@ -87,24 +88,37 @@
+ static unsigned long current_pages;
+ static unsigned long target_pages;
+ 
++/*
++ * use vm_committed_space as an approximation for balloon target, repeating
++ * every second.  Disabled if compiled as MODULE because kernel doesn't
++ * currently export vm_committed_space
++*/
++static int selfballoon = 1;
++static int dynamic_alloc = 0;
++static unsigned long dynamic_alloc_max_p;
++unsigned long current_max_pages;
++
+ /* We increase/decrease in batches which fit in a page */
+ static unsigned long frame_list[PAGE_SIZE / sizeof(unsigned long)];
+ 
+ /* VM /proc information for memory */
+ extern unsigned long totalram_pages;
+ 
++/* avoid possible write_proc race with xenstored startup */
++static int xenstored_ready = 0;
++
+ #ifndef MODULE
+ extern unsigned long totalhigh_pages;
++extern atomic_t vm_committed_space;
+ #define inc_totalhigh_pages() (totalhigh_pages++)
+ #define dec_totalhigh_pages() (totalhigh_pages--)
+ #else
+ #define inc_totalhigh_pages() ((void)0)
+ #define dec_totalhigh_pages() ((void)0)
++#undef atomic_read
++#define atomic_read(x) (0)
+ #endif
+ 
+-/* We may hit the hard limit in Xen. If we do then we remember it. */
+-static unsigned long hard_limit;
+-
+ /*
+  * Drivers may alter the memory reservation independently, but they must
+  * inform the balloon driver so that we can avoid hitting the hard limit.
+@@ -139,6 +153,12 @@
+ #define WPRINTK(fmt, args...) \
+ 	printk(KERN_WARNING "xen_mem: " fmt, ##args)
+ 
++
++static inline long get_vm_committed(void)
++{
++	return atomic_read(&vm_committed_space);
++}
++
+ /* balloon_append: add the given page to the balloon. */
+ static void balloon_append(struct page *page)
+ {
+@@ -151,6 +171,8 @@
+ 		list_add(PAGE_TO_LIST(page), &ballooned_pages);
+ 		balloon_low++;
+ 	}
++	
++	totalram_pages--;
+ }
+ 
+ /* balloon_retrieve: rescue a page from the balloon, if it is not empty. */
+@@ -171,6 +193,8 @@
+ 	else
+ 		balloon_low--;
+ 
++   totalram_pages++;
++
+ 	return page;
+ }
+ 
+@@ -196,12 +220,34 @@
+ 
+ static unsigned long current_target(void)
+ {
+-	unsigned long target = min(target_pages, hard_limit);
+-	if (target > (current_pages + balloon_low + balloon_high))
+-		target = current_pages + balloon_low + balloon_high;
+-	return target;
++       return min(target_pages, current_max_pages);
+ }
+ 
++static unsigned long minimum_target(void)
++{
++        unsigned long min_pages;
++        unsigned long curr_pages = current_target();
++
++#define MB2PAGES(mb) ((mb) << (20 - PAGE_SHIFT))
++
++      if (current_max_pages < MB2PAGES(300))
++		   min_pages = MB2PAGES(128) + (current_max_pages >> 6);
++	   else if (current_max_pages < MB2PAGES(1024))
++         min_pages = MB2PAGES(128) + (current_max_pages >> 5);
++	   else if (current_max_pages < MB2PAGES(2048))
++		   min_pages = MB2PAGES(128) + (current_max_pages >> 4);
++	   else if (current_max_pages < MB2PAGES(4096))
++         min_pages = MB2PAGES(128) + (current_max_pages >> 3);
++	   else
++		   min_pages = MB2PAGES(1024);
++
++#undef MB2PAGES
++
++        /* Don't enforce growth */
++        return min_pages < curr_pages ? min_pages : curr_pages;
++}
++
++
+ static int increase_reservation(unsigned long nr_pages)
+ {
+ 	unsigned long  pfn, i, flags;
+@@ -221,30 +267,19 @@
+ 	page = balloon_first_page();
+ 	for (i = 0; i < nr_pages; i++) {
+ 		BUG_ON(page == NULL);
+-		frame_list[i] = page_to_pfn(page);;
++		frame_list[i] = page_to_pfn(page);
+ 		page = balloon_next_page(page);
+ 	}
+ 
+ 	set_xen_guest_handle(reservation.extent_start, frame_list);
+ 	reservation.nr_extents   = nr_pages;
+-	rc = HYPERVISOR_memory_op(
+-		XENMEM_populate_physmap, &reservation);
+-	if (rc < nr_pages) {
+-		if (rc > 0) {
+-			int ret;
++   rc = HYPERVISOR_memory_op(
++               XENMEM_populate_physmap, &reservation);
++   if (rc < 0)
++      goto out;
+ 
+-			/* We hit the Xen hard limit: reprobe. */
+-			reservation.nr_extents = rc;
+-			ret = HYPERVISOR_memory_op(XENMEM_decrease_reservation,
+-					&reservation);
+-			BUG_ON(ret != rc);
+-		}
+-		if (rc >= 0)
+-			hard_limit = current_pages + rc - driver_pages;
+-		goto out;
+-	}
++   for (i = 0; i < rc; i++) {
+ 
+-	for (i = 0; i < nr_pages; i++) {
+ 		page = balloon_retrieve();
+ 		BUG_ON(page == NULL);
+ 
+@@ -273,20 +308,19 @@
+ 		init_page_count(page);
+ 		__free_page(page);
+ 	}
+-
+-	current_pages += nr_pages;
+-	totalram_pages = current_pages;
++	
++	current_pages += rc;
+ 
+  out:
+ 	balloon_unlock(flags);
+ 
+-	return 0;
++   return rc < 0 ? rc : rc != nr_pages;
+ }
+ 
+ static int decrease_reservation(unsigned long nr_pages)
+ {
+ 	unsigned long  pfn, i, flags;
+-	struct page   *page;
++	struct page   *page = NULL;
+ 	void          *v;
+ 	int            need_sleep = 0;
+ 	int ret;
+@@ -313,8 +347,7 @@
+ 			v = phys_to_virt(pfn << PAGE_SHIFT);
+ 			scrub_pages(v, 1);
+ #ifdef CONFIG_XEN
+-			ret = HYPERVISOR_update_va_mapping(
+-				(unsigned long)v, __pte_ma(0), 0);
++			ret = HYPERVISOR_update_va_mapping((unsigned long)v, __pte_ma(0), 0);
+ 			BUG_ON(ret);
+ #endif
+ 		}
+@@ -348,13 +381,39 @@
+ 	BUG_ON(ret != nr_pages);
+ 
+ 	current_pages -= nr_pages;
+-	totalram_pages = current_pages;
+ 
+ 	balloon_unlock(flags);
+ 
+ 	return need_sleep;
+ }
+ 
++
++/* Resets the Xen limit, sets new target, optionally schedules work */
++static void balloon_set_new_target(unsigned long target, int start)
++{
++   unsigned long min_pages = minimum_target();
++   
++	if (!target) return;
++	
++  	if (selfballoon) {
++  	
++      target = target + (target >> 1);
++     	
++     	if(target < current_max_pages)
++        	target = current_max_pages - ((current_max_pages - target)/2);
++        	
++      target = min(target, current_max_pages);
++      
++   } else {
++      target = current_max_pages;
++   }
++   
++   target = max(target, min_pages);
++	target_pages = target;
++   
++	if (start) schedule_work(&balloon_worker);
++}
++
+ /*
+  * We avoid multiple worker processes conflicting via the balloon mutex.
+  * We may of course race updates of the target counts (which are protected
+@@ -365,43 +424,151 @@
+ {
+ 	int need_sleep = 0;
+ 	long credit;
+-
++   static unsigned long target_pages;
++   
++   struct sysinfo si;
++   
+ 	down(&balloon_mutex);
+-
++   
++   if (xenstored_ready) {
++		(void)xenbus_printf(XBT_NIL, "memory", "actual", "%lu",
++			totalram_pages << (PAGE_SHIFT - 10));
++		(void)xenbus_printf(XBT_NIL, "memory", "minimum", "%lu",
++			minimum_target() << (PAGE_SHIFT - 10));
++	}
++	
++	sys_sysinfo(&si);
++	target_pages = get_vm_committed();
++	
++	if(si.uptime < 60 || ( si.uptime < 120 && si.procs < 100))
++	   target_pages = current_max_pages;
++	
++	
++   balloon_set_new_target(target_pages, 0);
++   
++   if (xenstored_ready)
++      (void)xenbus_printf(XBT_NIL, "memory", "selftarget",
++                "%lu", target_pages << (PAGE_SHIFT - 10));
++   
+ 	do {
+ 		credit = current_target() - current_pages;
++		
+ 		if (credit > 0)
+ 			need_sleep = (increase_reservation(credit) != 0);
+ 		if (credit < 0)
+ 			need_sleep = (decrease_reservation(-credit) != 0);
+-
++      
+ #ifndef CONFIG_PREEMPT
+ 		if (need_resched())
+ 			schedule();
+ #endif
+ 	} while ((credit != 0) && !need_sleep);
+ 
+-	/* Schedule more work if there is some still to be done. */
+-	if (current_target() != current_pages)
+-		mod_timer(&balloon_timer, jiffies + HZ);
+-
++	mod_timer(&balloon_timer, jiffies + msecs_to_jiffies(1000 * 0.2));
++   
+ 	up(&balloon_mutex);
+ }
+ 
+-/* Resets the Xen limit, sets new target, and kicks off processing. */
+-static void set_new_target(unsigned long target)
+-{
+-	/* No need for lock. Not read-modify-write updates. */
+-	hard_limit   = ~0UL;
+-	target_pages = target;
+-	schedule_work(&balloon_worker);
+-}
++static struct xenbus_watch selfballoon_watch =
++ {
++	.node = "memory/selfballoon"
++};
+ 
+ static struct xenbus_watch target_watch =
+ {
+ 	.node = "memory/target"
+ };
+ 
++
++static struct xenbus_watch dynamic_alloc_watch =
++{
++	.node = "memory/dynamic_alloc"
++};
++
++
++static struct xenbus_watch dynamic_alloc_max_p_watch =
++{
++	.node = "memory/dynamic_alloc_max"
++};
++
++
++/* React to a change in the selfballoon key */
++static void watch_selfballoon(struct xenbus_watch *watch,
++			 const char **vec, unsigned int len)
++{
++	unsigned long enable;
++	int err;
++   
++	err = xenbus_scanf(XBT_NIL, "memory", "selfballoon", "%lu", &enable);
++	if (err != 1) {
++		/* This is ok (for domain0 at least) - so just return */
++		return;
++	}
++	
++	selfballoon = enable;
++	
++	if(!selfballoon) {
++	   current_max_pages = xen_start_info->nr_pages;
++     	dynamic_alloc = 0;
++  	}
++ 	
++	balloon_set_new_target(get_vm_committed(), 1);
++}
++
++
++static void watch_dynamic_alloc(struct xenbus_watch *watch,
++			 const char **vec, unsigned int len)
++{
++	unsigned long enable;
++	int err;
++	
++	err = xenbus_scanf(XBT_NIL, "memory", "dynamic_alloc", "%lu", &enable);
++	if (err != 1) {
++		return;
++	}
++   
++   if(!selfballoon)
++      return;
++   
++	dynamic_alloc = enable;
++
++	if(dynamic_alloc)
++     	   current_max_pages = dynamic_alloc_max_p;
++   else
++         current_max_pages = xen_start_info->nr_pages;
++         
++   balloon_set_new_target(get_vm_committed(), 1);
++}
++
++
++static void watch_dynamic_alloc_max_p(struct xenbus_watch *watch,
++			 const char **vec, unsigned int len)
++{
++	unsigned long value;
++	unsigned long min_pages = minimum_target();
++	int err;
++	
++	err = xenbus_scanf(XBT_NIL, "memory", "dynamic_alloc_max", "%lu", &value);
++	if (err != 1) {
++		return;
++	}
++	
++   value = value << (20 - PAGE_SHIFT);
++
++   if (value > max_pfn)
++      value = max_pfn;
++   else if (value < min_pages)
++      value = min_pages;
++      
++	dynamic_alloc_max_p = value;
++	
++  	if(dynamic_alloc)
++	   current_max_pages = dynamic_alloc_max_p;
++	   
++   balloon_set_new_target(get_vm_committed(), 1);
++}
++
++
+ /* React to a change in the target key */
+ static void watch_target(struct xenbus_watch *watch,
+ 			 const char **vec, unsigned int len)
+@@ -418,18 +585,46 @@
+ 	/* The given memory/target value is in KiB, so it needs converting to
+ 	 * pages. PAGE_SHIFT converts bytes to pages, hence PAGE_SHIFT - 10.
+ 	 */
+-	set_new_target(new_target >> (PAGE_SHIFT - 10));
++	balloon_set_new_target(new_target >> (PAGE_SHIFT - 10), 1);
+ }
+ 
+ static int balloon_init_watcher(struct notifier_block *notifier,
+ 				unsigned long event,
+ 				void *data)
+ {
+-	int err;
++	int err, enable;
++	unsigned long value;
++   
++
++	/* ensure xenbus values and /proc/xen/balloon are consistent */
++	err = xenbus_scanf(XBT_NIL, "memory", "selfballoon", "%u", &enable);
++	if (err == 1)
++		selfballoon = enable;
++	else
++		(void)xenbus_printf(XBT_NIL, "memory", "selfballoon", "%lu", selfballoon ? 1UL : 0UL);
++
++
++	err = xenbus_scanf(XBT_NIL, "memory", "dynamic_alloc_max", "%lu", &value);
++	if (err == 1)
++   	   dynamic_alloc_max_p = value;
++	else
++		(void)xenbus_printf(XBT_NIL, "memory", "dynamic_alloc_max", "%lu", dynamic_alloc_max_p);
++
++
++	err = xenbus_scanf(XBT_NIL, "memory", "dynamic_alloc", "%u", &enable);
++	if (err == 1)
++		dynamic_alloc = enable;
++	else
++		(void)xenbus_printf(XBT_NIL, "memory", "dynamic_alloc", "%lu", dynamic_alloc ? 1UL : 0UL);
++
+ 
+ 	err = register_xenbus_watch(&target_watch);
++	err |= register_xenbus_watch(&selfballoon_watch);
++	err |= register_xenbus_watch(&dynamic_alloc_max_p_watch);
++	err |= register_xenbus_watch(&dynamic_alloc_watch);
+ 	if (err)
+ 		printk(KERN_ERR "Failed to set balloon watcher\n");
++   else xenstored_ready = 1;
+ 
+ 	return NOTIFY_DONE;
+ }
+@@ -440,11 +635,12 @@
+ {
+ 	char memstring[64], *endchar;
+ 	unsigned long long target_bytes;
+-
++   unsigned long vm_pages;
++   
+ 	if (!capable(CAP_SYS_ADMIN))
+ 		return -EPERM;
+-
+-	if (count <= 1)
++   
++	if (!count)
+ 		return -EBADMSG; /* runt */
+ 	if (count > sizeof(memstring))
+ 		return -EFBIG;   /* too long */
+@@ -452,10 +648,22 @@
+ 	if (copy_from_user(memstring, buffer, count))
+ 		return -EFAULT;
+ 	memstring[sizeof(memstring)-1] = '\0';
+-
++   
+ 	target_bytes = memparse(memstring, &endchar);
+-	set_new_target(target_bytes >> PAGE_SHIFT);
+-
++   
++   if (target_bytes <= 1) {
++		selfballoon = target_bytes;
++		if (xenstored_ready) { /* let watch_selfballoon handle */
++			(void)xenbus_printf(XBT_NIL, "memory",
++				"selfballoon", "%lu", selfballoon ? 1UL : 0UL);
++		} else if (selfballoon) {
++			vm_pages = get_vm_committed();
++			balloon_set_new_target(vm_pages, 1);
++		}
++	}
++	else
++	   balloon_set_new_target(target_bytes >> PAGE_SHIFT, 1);
++   
+ 	return count;
+ }
+ 
+@@ -466,21 +674,20 @@
+ 
+ 	len = sprintf(
+ 		page,
++		"Memory ballooning:  %s\n"
++		"Memory boost:       %s\n"
++		"Current max:        %8lu kB\n"
+ 		"Current allocation: %8lu kB\n"
+ 		"Requested target:   %8lu kB\n"
+ 		"Low-mem balloon:    %8lu kB\n"
+ 		"High-mem balloon:   %8lu kB\n"
+-		"Driver pages:       %8lu kB\n"
+-		"Xen hard limit:     ",
+-		PAGES2KB(current_pages), PAGES2KB(target_pages), 
+-		PAGES2KB(balloon_low), PAGES2KB(balloon_high),
++		"Driver pages:       %8lu kB\n",
++		(selfballoon?"on":"off"),(dynamic_alloc?"on":"off"), 
++		PAGES2KB(current_max_pages),
++		PAGES2KB(current_pages),PAGES2KB(target_pages),
++		PAGES2KB(balloon_low),PAGES2KB(balloon_high),
+ 		PAGES2KB(driver_pages));
+ 
+-	if (hard_limit != ~0UL)
+-		len += sprintf(page + len, "%8lu kB\n", PAGES2KB(hard_limit));
+-	else
+-		len += sprintf(page + len, "     ??? kB\n");
+-
+ 	*eof = 1;
+ 	return len;
+ }
+@@ -500,23 +707,19 @@
+ 
+ 	IPRINTK("Initialising balloon driver.\n");
+ 
+-#ifdef CONFIG_XEN
+ 	current_pages = min(xen_start_info->nr_pages, max_pfn);
+-	totalram_pages = current_pages;
+-#else
+-	current_pages = totalram_pages;
+-#endif
+ 	target_pages  = current_pages;
+ 	balloon_low   = 0;
+ 	balloon_high  = 0;
+ 	driver_pages  = 0UL;
+-	hard_limit    = ~0UL;
+-
++   
++   dynamic_alloc_max_p = max_pfn;
++   current_max_pages = current_pages;
++   
+ 	init_timer(&balloon_timer);
+ 	balloon_timer.data = 0;
+ 	balloon_timer.function = balloon_alarm;
+-    
+-#if defined(CONFIG_PROC_FS) && defined(CONFIG_XEN_PRIVILEGED_GUEST)
++   
+ 	if ((balloon_pde = create_xen_proc_entry("balloon", 0644)) == NULL) {
+ 		WPRINTK("Unable to create /proc/xen/balloon.\n");
+ 		return -1;
+@@ -524,22 +727,21 @@
+ 
+ 	balloon_pde->read_proc  = balloon_read;
+ 	balloon_pde->write_proc = balloon_write;
+-#endif
+-    
+-#if defined(CONFIG_X86) && defined(CONFIG_XEN) 
++
+ 	/* Initialise the balloon with excess memory space. */
+ 	for (pfn = xen_start_info->nr_pages; pfn < max_pfn; pfn++) {
+-		page = pfn_to_page(pfn);
++   	page = pfn_to_page(pfn);
+ 		if (!PageReserved(page))
+ 			balloon_append(page);
+ 	}
+-#endif
+-
++	
+ 	target_watch.callback = watch_target;
+ 	xenstore_notifier.notifier_call = balloon_init_watcher;
+-
++   selfballoon_watch.callback = watch_selfballoon;
++	dynamic_alloc_max_p_watch.callback = watch_dynamic_alloc_max_p;
++	dynamic_alloc_watch.callback = watch_dynamic_alloc;
+ 	register_xenstore_notifier(&xenstore_notifier);
+-    
++   
+ 	return 0;
+ }
+ 
